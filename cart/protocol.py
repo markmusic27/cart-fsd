@@ -2,7 +2,8 @@
 
 Host → Arduino
 --------------
-  T G<0-1> B<0-1> A<angle>\\n   Set targets (gas, brake, steering angle)
+  T G<0-1> B<0-1> A<angle> [S<-1..1>]\\n
+                                Set pedal targets and optional open-loop steering command
   C <key> <value>\\n             Config update
   E\\n                           Software emergency stop
   Z\\n                           Zero encoder
@@ -24,9 +25,22 @@ from cart.config import CartConfig, CartState
 # Encoding — Python → Arduino
 # ---------------------------------------------------------------------------
 
-def encode_targets(gas: float, brake: float, steering_angle: float) -> bytes:
-    """Build a target command string."""
-    return f"T G{gas:.3f} B{brake:.3f} A{steering_angle:.1f}\n".encode()
+def encode_targets(
+    gas: float,
+    brake: float,
+    steering_angle: float,
+    steering_command: float | None = None,
+) -> bytes:
+    """Build a target command string.
+
+    `steering_angle` is for closed-loop steering targets.
+    `steering_command` is an optional normalized open-loop motor command in
+    [-1.0, 1.0]. When present, firmware treats steering as open-loop.
+    """
+    command = f"T G{gas:.3f} B{brake:.3f} A{steering_angle:.1f}"
+    if steering_command is not None:
+        command += f" S{steering_command:.3f}"
+    return f"{command}\n".encode()
 
 
 def encode_estop() -> bytes:
@@ -46,6 +60,7 @@ def encode_config(key: str, value: float | int) -> bytes:
 
 # Config key mapping: CartConfig field → Arduino config key
 _CONFIG_KEYS: list[tuple[str, str]] = [
+    ("safety", "SAFE"),
     ("gas_kp", "GKP"),
     ("gas_kd", "GKD"),
     ("brake_kp", "BKP"),
@@ -65,7 +80,10 @@ def encode_full_config(config: CartConfig) -> list[bytes]:
     """Return a list of config command bytes for every tunable parameter."""
     cmds: list[bytes] = []
     for attr, key in _CONFIG_KEYS:
-        cmds.append(encode_config(key, getattr(config, attr)))
+        value = getattr(config, attr)
+        if isinstance(value, bool):
+            value = int(value)
+        cmds.append(encode_config(key, value))
     return cmds
 
 

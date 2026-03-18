@@ -151,7 +151,7 @@ Calibrated potentiometer readings (normalized ADC / 1023):
 | Pedal | POS_MIN (retracted) | POS_MAX (fully pressed) | Range |
 |-------|---------------------|-------------------------|-------|
 | Gas   | 0.05                | 0.72                    | 0.67  |
-| Brake | 0.42                | 0.90                    | 0.48  |
+| Brake | 0.47                | 0.90                    | 0.43  |
 
 These are baked into the Arduino firmware.  The Python side works in
 normalized 0–1 space; the Arduino maps to the physical range:

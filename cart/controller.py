@@ -70,6 +70,7 @@ class CartController:
         self._gas_target: float = 0.0
         self._brake_target: float = 0.0
         self._steering_target: float = 0.0
+        self._steering_command: float | None = None
 
         # Latest state from Arduino
         self._state = CartState()
@@ -117,6 +118,18 @@ class CartController:
         limit = self._config.steering_max_angle
         with self._lock:
             self._steering_target = _clamp(angle, -limit, limit)
+            self._steering_command = None
+        self._change_event.set()
+
+    def set_steering_open_loop(self, command: float) -> None:
+        """Set normalized open-loop steering motor command in [-1.0, 1.0].
+
+        -1.0 = full left motor command
+         0.0 = stop steering motor
+        +1.0 = full right motor command
+        """
+        with self._lock:
+            self._steering_command = _clamp(command, -1.0, 1.0)
         self._change_event.set()
 
     def stop(self) -> None:
@@ -125,6 +138,7 @@ class CartController:
             self._gas_target = 0.0
             self._brake_target = 1.0
             self._steering_target = 0.0
+            self._steering_command = 0.0
         self._safe_write(encode_estop())
         self._change_event.set()
 
@@ -153,7 +167,11 @@ class CartController:
         self._change_event.set()  # unblock the thread if sleeping
         self._thread.join(timeout=2.0)
         try:
-            self._safe_write(encode_estop())
+            if self._config.safety:
+                self._safe_write(encode_estop())
+            else:
+                self._safe_write(encode_targets(0.0, 0.0, 0.0))
+                time.sleep(0.02)
             self._ser.close()
         except Exception:
             pass
@@ -175,7 +193,8 @@ class CartController:
             gas = self._gas_target
             brake = self._brake_target
             angle = self._steering_target
-        self._safe_write(encode_targets(gas, brake, angle))
+            command = self._steering_command
+        self._safe_write(encode_targets(gas, brake, angle, command))
 
     def _read_state(self) -> None:
         try:

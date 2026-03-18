@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -13,7 +15,7 @@ from dataclasses import dataclass, field
 # endpoints.  Measured from the old caddy_drive.ino firmware.
 GAS_POS_MIN: float = 0.05
 GAS_POS_MAX: float = 0.72
-BRAKE_POS_MIN: float = 0.42
+BRAKE_POS_MIN: float = 0.47
 BRAKE_POS_MAX: float = 0.90
 
 GAS_POS_RANGE: float = GAS_POS_MAX - GAS_POS_MIN
@@ -31,8 +33,8 @@ STEERING_SPROCKET_TEETH: int = 36
 SPROCKET_RATIO: float = MOTOR_SPROCKET_TEETH / STEERING_SPROCKET_TEETH
 
 # Steering limits (measured from steering_calibration.json)
-STEERING_MAX_RIGHT_DEG: float = 272.9
-STEERING_MAX_LEFT_DEG: float = -276.8
+STEERING_MAX_RIGHT_DEG: float = 250.0
+STEERING_MAX_LEFT_DEG: float = -250
 
 # Cart speed reference (approximate)
 CART_TOP_SPEED_MPH: float = 15.0
@@ -41,13 +43,62 @@ CART_TOP_SPEED_MPH: float = 15.0
 DEFAULT_BAUD_RATE: int = 115200
 
 # Timing
-SEND_INTERVAL_S: float = 0.020  # 50 Hz baseline tick
+SEND_INTERVAL_S: float = 0.010  # 100 Hz baseline tick
 WATCHDOG_TIMEOUT_MS: int = 250
 
 # Motor PWM limits (Arduino-side)
 PWM_MIN: int = 0
 PWM_MAX: int = 255
 MIN_PWM_THRESHOLD: int = 60  # below this the motor can't overcome static friction
+
+# Control limits settings file
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CONTROL_LIMITS_PATH = REPO_ROOT / "settings" / "control_limits.json"
+
+
+def load_control_limits() -> dict[str, int | float]:
+    """Load editable control limits from disk.
+
+    The file is intentionally simple so it can be edited quickly:
+
+        {
+          "gas_limit_percent": 100,
+          "steering_max_right_deg": 220,
+          "steering_max_left_deg": -220
+        }
+    """
+    default_limits: dict[str, int | float] = {
+        "gas_limit_percent": 100,
+        "steering_max_right_deg": 220.0,
+        "steering_max_left_deg": -220.0,
+    }
+    try:
+        data = json.loads(CONTROL_LIMITS_PATH.read_text())
+        gas_limit_percent = int(data.get("gas_limit_percent", 100))
+        steering_max_right_deg = float(data.get("steering_max_right_deg", 220.0))
+        steering_max_left_deg = float(data.get("steering_max_left_deg", -220.0))
+        default_limits["gas_limit_percent"] = max(0, min(100, gas_limit_percent))
+        default_limits["steering_max_right_deg"] = max(0.0, steering_max_right_deg)
+        default_limits["steering_max_left_deg"] = min(0.0, steering_max_left_deg)
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        pass
+    return default_limits
+
+
+def default_gas_limit_percent() -> int:
+    return load_control_limits()["gas_limit_percent"]
+
+
+def default_gas_limit_fraction() -> float:
+    return default_gas_limit_percent() / 100.0
+
+
+def default_steering_max_right_deg() -> float:
+    return float(load_control_limits()["steering_max_right_deg"])
+
+
+def default_steering_max_left_deg() -> float:
+    return float(load_control_limits()["steering_max_left_deg"])
 
 
 # ---------------------------------------------------------------------------
@@ -69,27 +120,30 @@ class CartConfig:
     """
 
     # --- displacement caps (0.0–1.0) ---
-    gas_max_position: float = 1.0
+    gas_max_position: float = field(default_factory=default_gas_limit_fraction)
     brake_max_position: float = 1.0
-    steering_max_angle: float = 240.0  # degrees at the steering column
+    steering_max_angle: float = 240.0  # symmetric legacy fallback
+    steering_max_right_angle: float = field(default_factory=default_steering_max_right_deg)
+    steering_max_left_angle: float = field(default_factory=default_steering_max_left_deg)
+    safety: bool = True
 
     # --- actuator speed caps (max PWM 0–255) ---
     gas_max_pwm: int = 255
     brake_max_pwm: int = 255
-    steering_max_pwm: int = 200
+    steering_max_pwm: int = 255
 
     # --- PD gains (sent to Arduino via config commands) ---
-    gas_kp: float = 800.0
-    gas_kd: float = 50.0
-    brake_kp: float = 600.0
-    brake_kd: float = 40.0
-    steering_kp: float = 5.0
-    steering_kd: float = 0.3
+    gas_kp: float = 1200.0
+    gas_kd: float = 70.0
+    brake_kp: float = 1000.0
+    brake_kd: float = 60.0
+    steering_kp: float = 2.0
+    steering_kd: float = 0.9
 
     # --- deadbands ---
-    gas_deadband: float = 0.008
-    brake_deadband: float = 0.02
-    steering_deadband: float = 2.0  # degrees
+    gas_deadband: float = 0.05
+    brake_deadband: float = 0.05
+    steering_deadband: float = 10.0  # about 5% of a 180-200 deg steering range
 
 
 # ---------------------------------------------------------------------------

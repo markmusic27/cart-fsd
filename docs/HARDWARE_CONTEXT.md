@@ -388,7 +388,7 @@ Special responses: `CADDY READY`, `ALL STOPPED`, `ZEROED`,
 | Pedal | POS_MIN | POS_MAX | Deadband |
 |-------|---------|---------|----------|
 | Gas   | 0.05    | 0.72    | 0.008    |
-| Brake | 0.42    | 0.90    | 0.025    |
+| Brake | 0.47    | 0.90    | 0.025    |
 
 **Steering — Open-loop direction control:**
 - The Arduino only receives a direction: −1 (CCW/left), 0 (stop), +1 (CW/right)

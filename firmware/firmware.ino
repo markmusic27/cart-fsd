@@ -56,29 +56,36 @@ volatile long encoderCount = 0;
 const float GAS_POS_MIN = 0.05;
 const float GAS_POS_MAX = 0.72;
 
-const float BRK_POS_MIN = 0.42;
+const float BRK_POS_MIN = 0.47;
 const float BRK_POS_MAX = 0.90;
 
 // =====================================================================
 // PD controller defaults (overridable via C commands)
 // =====================================================================
 
-float gasKp  = 800.0;
-float gasKd  = 50.0;
-float brkKp  = 600.0;
-float brkKd  = 40.0;
-float strKp  = 5.0;
-float strKd  = 0.3;
+float gasKp  = 1200.0;
+float gasKd  = 70.0;
+float brkKp  = 1000.0;
+float brkKd  = 60.0;
+float strKp  = 2.0;
+float strKd  = 0.9;
 
 int   gasMaxPwm = 255;
 int   brkMaxPwm = 255;
-int   strMaxPwm = 200;
+int   strMaxPwm = 255;
 
-float gasDeadband = 0.008;
-float brkDeadband = 0.025;
-float strDeadband = 2.0;   // degrees
+float gasDeadband = 0.05;
+float brkDeadband = 0.05;
+float strDeadband = 10.0;   // degrees
 
-const int MIN_PWM = 60;    // below this the motor can't overcome friction
+const int PEDAL_MIN_PWM = 110;
+const int STEER_MIN_PWM = 65;
+const int STEER_MID_MIN_PWM = 50;
+const int STEER_PWM_SLEW_PER_LOOP = 7;  // ~105 ms from 0 to full at 200 Hz
+const float STR_REENGAGE_DEADBAND = 15.0;
+const float STR_SMALL_ERROR_BAND = 18.0;
+const float STR_LARGE_ERROR_BAND = 35.0;
+const float STR_OUTPUT_DEADBAND = 18.0;
 
 // =====================================================================
 // State
@@ -89,6 +96,9 @@ float gasTarget = -1.0;
 float brkTarget = -1.0;
 float strTarget =  0.0;   // degrees at steering column
 bool  strActive = false;
+float strCommand = 0.0;   // normalized open-loop command [-1, 1]
+bool  strOpenLoop = false;
+int   strAppliedPwm = 0;
 
 // Previous positions for derivative (velocity) calculation
 float gasPrevPos = 0.0;
@@ -97,7 +107,7 @@ float strPrevAngle = 0.0;
 
 // Timing
 unsigned long prevLoopMicros = 0;
-const unsigned long LOOP_INTERVAL_US = 10000;  // 10 ms → 100 Hz
+const unsigned long LOOP_INTERVAL_US = 5000;  // 5 ms → 200 Hz
 
 // Watchdog
 unsigned long lastCommandTime = 0;
@@ -106,9 +116,10 @@ bool watchdogTripped = false;
 
 // Hardware e-stop
 volatile bool eStopActive = false;
+bool safetyEnabled = true;
 
 // State report throttle (send every N loops to avoid flooding serial)
-const int STATE_REPORT_INTERVAL = 2;  // every 2nd loop → ~50 Hz
+const int STATE_REPORT_INTERVAL = 4;  // every 4th loop → ~50 Hz at 200 Hz loop
 int stateReportCounter = 0;
 
 // =====================================================================
@@ -143,6 +154,12 @@ void strDrive(int pwm) {
 }
 
 void allDisable() { gasDisable(); brkDisable(); strDisable(); }
+
+int slewPwmToward(int currentPwm, int targetPwm, int maxStep) {
+  if (targetPwm > currentPwm + maxStep) return currentPwm + maxStep;
+  if (targetPwm < currentPwm - maxStep) return currentPwm - maxStep;
+  return targetPwm;
+}
 
 // =====================================================================
 // Sensor reads
@@ -213,8 +230,8 @@ void updatePedalPD(
   output = constrain(output, (float)-maxPwm, (float)maxPwm);
 
   // Enforce minimum PWM to overcome static friction
-  if (abs(output) < MIN_PWM) {
-    output = (output > 0) ? MIN_PWM : -MIN_PWM;
+  if (abs(output) < PEDAL_MIN_PWM) {
+    output = (output > 0) ? PEDAL_MIN_PWM : -PEDAL_MIN_PWM;
   }
 
   drive((int)output);
@@ -246,24 +263,75 @@ void updateBrake(float dt) {
 }
 
 void updateSteering(float dt) {
-  if (!strActive) { strDisable(); strSettled = true; return; }
+  if (strOpenLoop) {
+    float currentAngle = getSteeringAngle();
+    if (abs(strCommand) < 0.05) {
+      strDisable();
+      strAppliedPwm = 0;
+      strSettled = true;
+      strPrevAngle = currentAngle;
+      return;
+    }
+
+    strSettled = false;
+    int targetPwm = (int)(abs(strCommand) * strMaxPwm);
+    if (targetPwm < STEER_MID_MIN_PWM) targetPwm = STEER_MID_MIN_PWM;
+    targetPwm = constrain(targetPwm, 0, strMaxPwm);
+    if (strCommand < 0) targetPwm = -targetPwm;
+
+    strAppliedPwm = slewPwmToward(strAppliedPwm, targetPwm, STEER_PWM_SLEW_PER_LOOP);
+    strDrive(strAppliedPwm);
+
+    strPrevAngle = currentAngle;
+    return;
+  }
+
+  if (!strActive) { strDisable(); strAppliedPwm = 0; strSettled = true; return; }
 
   float currentAngle = getSteeringAngle();
   float error = strTarget - currentAngle;
+  float absError = abs(error);
 
-  if (abs(error) < strDeadband) {
+  if (strSettled && absError < STR_REENGAGE_DEADBAND) {
     strDisable();
+    strAppliedPwm = 0;
+    strPrevAngle = currentAngle;
+    return;
+  }
+
+  if (absError < strDeadband) {
+    strDisable();
+    strAppliedPwm = 0;
     strSettled = true;
     strPrevAngle = currentAngle;
     return;
   }
   strSettled = false;
 
-  // Phase 1: simple proportional direction with fixed speed.
-  // Phase 2 will add full PD closed-loop steering.
-  int pwm = strMaxPwm;
-  if (error > 0) strDrive(pwm);
-  else           strDrive(-pwm);
+  float velocity = (dt > 0.0001) ? (currentAngle - strPrevAngle) / dt : 0.0;
+  float output = strKp * error - strKd * velocity;
+  output = constrain(output, (float)-strMaxPwm, (float)strMaxPwm);
+
+  if (abs(output) < STR_OUTPUT_DEADBAND) {
+    strDisable();
+    strAppliedPwm = 0;
+    strPrevAngle = currentAngle;
+    return;
+  }
+
+  int steerMinPwm = 0;
+  if (absError > STR_LARGE_ERROR_BAND) {
+    steerMinPwm = STEER_MIN_PWM;
+  } else if (absError > STR_SMALL_ERROR_BAND) {
+    steerMinPwm = STEER_MID_MIN_PWM;
+  }
+
+  if (steerMinPwm > 0 && abs(output) < steerMinPwm) {
+    output = (output > 0) ? steerMinPwm : -steerMinPwm;
+  }
+
+  strAppliedPwm = slewPwmToward(strAppliedPwm, (int)output, STEER_PWM_SLEW_PER_LOOP);
+  strDrive(strAppliedPwm);
 
   strPrevAngle = currentAngle;
 }
@@ -276,6 +344,8 @@ void applySafeState() {
   gasTarget = gasUserToPos(0.0);   // retract gas
   brkTarget = brkUserToPos(1.0);   // full brake
   strActive = false;               // hold steering
+  strOpenLoop = false;
+  strCommand = 0.0;
 }
 
 // =====================================================================
@@ -312,7 +382,8 @@ void parseCommand(String cmd) {
     String key = cmd.substring(2, sp1);
     float val = cmd.substring(sp1 + 1).toFloat();
 
-    if      (key == "GKP")  gasKp = val;
+    if      (key == "SAFE") safetyEnabled = ((int)val != 0);
+    else if (key == "GKP")  gasKp = val;
     else if (key == "GKD")  gasKd = val;
     else if (key == "BKP")  brkKp = val;
     else if (key == "BKD")  brkKd = val;
@@ -327,7 +398,7 @@ void parseCommand(String cmd) {
     return;
   }
 
-  // T — set targets: "T G<val> B<val> A<angle>"
+  // T — set targets: "T G<val> B<val> A<angle> [S<command>]"
   if (first == 'T') {
     // If hardware e-stop is active, ignore target commands
     if (eStopActive) return;
@@ -335,22 +406,39 @@ void parseCommand(String cmd) {
     int gi = cmd.indexOf('G');
     int bi = cmd.indexOf('B');
     int ai = cmd.indexOf('A');
+    int si = cmd.indexOf('S');
 
     if (gi >= 0) {
-      int endIdx = bi >= 0 ? bi : (ai >= 0 ? ai : cmd.length());
+      int endIdx = cmd.length();
+      if (bi >= 0 && bi < endIdx) endIdx = bi;
+      if (ai >= 0 && ai < endIdx) endIdx = ai;
+      if (si >= 0 && si < endIdx) endIdx = si;
       float val = constrain(cmd.substring(gi + 1, endIdx).toFloat(), 0.0, 1.0);
       gasTarget = gasUserToPos(val);
     }
 
     if (bi >= 0) {
-      int endIdx = ai >= 0 ? ai : cmd.length();
+      int endIdx = cmd.length();
+      if (ai >= 0 && ai < endIdx) endIdx = ai;
+      if (si >= 0 && si < endIdx) endIdx = si;
       float val = constrain(cmd.substring(bi + 1, endIdx).toFloat(), 0.0, 1.0);
       brkTarget = brkUserToPos(val);
     }
 
     if (ai >= 0) {
-      strTarget = cmd.substring(ai + 1).toFloat();
+      int endIdx = cmd.length();
+      if (si >= 0 && si < endIdx) endIdx = si;
+      strTarget = cmd.substring(ai + 1, endIdx).toFloat();
       strActive = true;
+    }
+
+    if (si >= 0) {
+      strCommand = constrain(cmd.substring(si + 1).toFloat(), -1.0, 1.0);
+      strOpenLoop = true;
+      strActive = false;
+    } else {
+      strCommand = 0.0;
+      strOpenLoop = false;
     }
     return;
   }
@@ -398,6 +486,7 @@ void sendStateReport() {
 
 void setup() {
   Serial.begin(115200);
+  Serial.setTimeout(2);
 
   // Encoder
   pinMode(ENC_A, INPUT);
@@ -462,10 +551,21 @@ void loop() {
   }
 
   // Watchdog: no command received within timeout
-  if (!eStopActive && (millis() - lastCommandTime > WATCHDOG_TIMEOUT_MS)) {
+  if (safetyEnabled && !eStopActive && (millis() - lastCommandTime > WATCHDOG_TIMEOUT_MS)) {
     if (!watchdogTripped) {
       watchdogTripped = true;
       applySafeState();
+    }
+  }
+
+  // --- Read serial commands ---
+  while (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    parseCommand(input);
+
+    // If hardware e-stop was released and a new command arrived, clear it
+    if (eStopActive && digitalRead(ESTOP_PIN) == LOW) {
+      eStopActive = false;
     }
   }
 
@@ -479,16 +579,5 @@ void loop() {
   if (stateReportCounter >= STATE_REPORT_INTERVAL) {
     stateReportCounter = 0;
     sendStateReport();
-  }
-
-  // --- Read serial commands ---
-  if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');
-    parseCommand(input);
-
-    // If hardware e-stop was released and a new command arrived, clear it
-    if (eStopActive && digitalRead(ESTOP_PIN) == LOW) {
-      eStopActive = false;
-    }
   }
 }

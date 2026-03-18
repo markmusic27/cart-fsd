@@ -1,0 +1,5 @@
+{
+  "gas_limit_percent": 55,
+  "steering_max_right_deg": 250,
+  "steering_max_left_deg": -250
+}
