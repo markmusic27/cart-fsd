@@ -221,7 +221,7 @@ To drive a motor:
 18  ■  Encoder White / Ch A    (INT5)
 19  ■  Encoder Green / Ch B    (INT4)
 20  ■  Encoder Yellow / Index  (INT3)
-21  —  (INT2, free)
+21  ■  E-Stop Button (NC)        (INT2)
 22–53  (free)
 ```
 
