@@ -5,7 +5,9 @@ ps5_drive.py — Drive the cart with a PS5 DualSense controller.
 Reads the DualSense over pygame and commands both cart subsystems with
 authority clamped by ``limits.py``:
 
-  - Left stick X  → steering column angle (ODrive S1, position control)
+  - Left stick X  → steering column (ODrive **POSITION + TRAP_TRAJ**, same
+    planner as ``main.py`` sweeps). ``integrated`` slews a held target angle;
+    ``absolute`` maps stick position to angle.
   - R2 trigger    → gas pedal target (Arduino Mega over USB serial)
   - L2 trigger    → brake pedal target (Arduino Mega over USB serial)
 
@@ -33,12 +35,21 @@ Safety:
   - ``--dry-run`` skips all hardware and just prints what would be sent,
     handy for checking input mapping without the cart present.
 
+Stick steering (``--stick-steering``):
+
+  ``integrated`` — stick slews a **target column angle** (°); the ODrive
+  **trap trajectory** tracks it with the same vel/accel caps as calibration
+  sweeps (``main.py``). Release the stick and the target (and wheel) **hold**.
+
+  ``absolute`` — stick position maps directly to target angle; center → 0°.
+
 Usage:
 
-    uv run python scripts/ps5_drive.py                    # full control
-    uv run python scripts/ps5_drive.py --mode steering    # steering only
-    uv run python scripts/ps5_drive.py --mode pedals      # pedals only
-    uv run python scripts/ps5_drive.py --dry-run          # no hardware
+    uv run python scripts/ps5_drive.py                              # full, integrated steer
+    uv run python scripts/ps5_drive.py --stick-steering absolute    # wheel follows stick
+    uv run python scripts/ps5_drive.py --mode steering              # steering only
+    uv run python scripts/ps5_drive.py --mode pedals                # pedals only
+    uv run python scripts/ps5_drive.py --dry-run                    # no hardware
 """
 
 from __future__ import annotations
@@ -65,6 +76,7 @@ from limits import (
     STEERING_MAX_DEG,
     STEERING_MIN_DEG,
     effective_gas_cap,
+    motor_turns_to_steering_deg,
     steering_deg_to_motor_turns,
 )
 
@@ -74,8 +86,10 @@ AXIS_LEFT_X = 0
 AXIS_L2 = 4
 AXIS_R2 = 5
 
-# Treat resting stick drift as zero.
+# Default deadzone (e.g. other scripts). Steering X uses ``STEER_STICK_DEADZONE`` so
+# more physical travel maps to rate — a large deadzone + remap makes mid‑stick feel weak.
 STICK_DEADZONE = 0.08
+STEER_STICK_DEADZONE = 0.055
 
 # Per-trigger calibration — some DualSense units/driver stacks don't quite
 # report full-scale on the triggers; rescale so full-squeeze reads 1.0.
@@ -89,17 +103,31 @@ TRIGGER_MAX_R2 = 1.00
 # this once the full lock-to-lock range is known and trusted.
 PS5_STEERING_MAX_DEG = min(60.0, STEERING_MAX_DEG, -STEERING_MIN_DEG)
 
-# Trajectory-planner limits for steering under human control. These are
-# well below the test-sweep values in ``main.py`` — a human on a stick
-# is slower than the motor, so there's no reason to let the planner race.
-TRAP_VEL_MAX = 4.0      # turns/s
-TRAP_ACCEL_MAX = 8.0    # turns/s^2
-TRAP_DECEL_MAX = 8.0    # turns/s^2
+# Trapezoidal planner caps — **match ``main.py``** so PS5 steering uses the same
+# consistent ODrive-generated motion as calibration sweeps (motor-side units).
+PS5_TRAP_VEL_MAX = 8.0      # motor turns/s
+PS5_TRAP_ACCEL_MAX = 15.0  # motor turns/s²
+PS5_TRAP_DECEL_MAX = 15.0
+
+# Integrated mode: how fast the **target angle** slews with full stick (°/s at |lx|=1).
+# The wheel follows via TRAP_TRAJ; high values let the planner saturate at PS5_TRAP_*.
+STEER_INTEGRATE_RATE_DPS = 320.0
+
+# Motor current headroom: scale current_soft_max toward current_hard_max with
+# demand ∈ [0,1] from |stick|, |d(lx)/dt|, and |d(ω_cmd)/dt| so fast reversals
+# keep torque for acceleration instead of hitting an overly low soft limit.
+PS5_STEER_CURRENT_BLEND_MIN = 0.45   # demand=0 → keep at least this fraction of headroom
+PS5_STEER_CURRENT_HARD_CAP_A = 80.0  # never raise soft_max above this (motor / fuse sanity)
+
+# Reference scales for mapping stick dynamics into current demand (tunable).
+STICK_DLX_REF = 10.0                  # |dlx/dt| ≈ this → full “stick dynamics” contribution
+VEL_CMD_ACCEL_REF = 120.0             # motor turns/s² reference for ω_cmd slew
 
 # Main-loop rate for reading the controller and pushing commands.
 CONTROL_HZ = 50.0
 
 MODES = ("full", "steering", "pedals")
+STICK_STEERING = ("absolute", "integrated")
 
 # --- UI colors --------------------------------------------------------------
 
@@ -288,27 +316,62 @@ class PedalLink:
                 pass
 
 
-class SteeringLink:
-    """ODrive S1 position-control wrapper for PS5-driven steering.
+def _odrive_cfg(obj: object) -> object:
+    """Return ``obj.config`` when it exists; otherwise the flat ``obj`` (libodrive style).
 
-    Takes ``pos_estimate`` at startup as 0° (same convention as
-    ``main.py``) — the operator must center the wheels before launching.
+    Never fall back to ``obj`` when ``config`` is missing on **motor** — motor
+    fields like ``current_soft_max`` only exist on ``motor.config`` in legacy
+    layouts, not on ``motor`` itself.
+    """
+    if hasattr(obj, "config"):
+        return obj.config
+    return obj
+
+
+def _motor_amp_limits(axis) -> tuple[float | None, float | None]:
+    """``(current_soft_max, current_hard_max)`` in A, or ``(None, None)`` if not on this API."""
+    m = axis.motor
+    if hasattr(m, "config"):
+        c = m.config
+        if hasattr(c, "current_soft_max") and hasattr(c, "current_hard_max"):
+            return float(c.current_soft_max), float(c.current_hard_max)
+    return None, None
+
+
+def _set_motor_current_soft_max(axis, value: float) -> None:
+    m = axis.motor
+    if hasattr(m, "config") and hasattr(m.config, "current_soft_max"):
+        m.config.current_soft_max = value
+
+
+class SteeringLink:
+    """ODrive S1 wrapper for PS5 steering.
+
+    Both ``integrated`` and ``absolute`` use **POSITION_CONTROL** and
+    **TRAP_TRAJ** with the same ``vel_limit`` / ``accel_limit`` / ``decel_limit``
+    as ``main.py`` calibration sweeps so motion is generated consistently on
+    the ODrive, not by host-side velocity filtering.
     """
 
-    def __init__(self, dry_run: bool = False):
+    def __init__(self, dry_run: bool = False, stick_steering: str = "integrated"):
         self.dry_run = dry_run
+        self.stick_steering = stick_steering
         self.odrv = None
         self.axis = None
         self.start_pos = 0.0
         self._AxisState = None
         self._InputMode = None
+        self._saved_current_soft = None
+        self._saved_current_hard = None
+        self._prev_target_motor = 0.0
+        self._prev_vel_cmd_motor = 0.0
 
         if dry_run:
             print("[steering] dry-run: ODrive will NOT be opened.")
             return
 
         import odrive  # type: ignore
-        from odrive.enums import AxisState, InputMode  # type: ignore
+        from odrive.enums import AxisState, ControlMode, InputMode  # type: ignore
 
         self._AxisState = AxisState
         self._InputMode = InputMode
@@ -326,13 +389,37 @@ class SteeringLink:
             self.odrv.clear_errors()
             time.sleep(0.3)
 
-        self.axis.controller.config.input_mode = InputMode.TRAP_TRAJ
-        self.axis.trap_traj.config.vel_limit = TRAP_VEL_MAX
-        self.axis.trap_traj.config.accel_limit = TRAP_ACCEL_MAX
-        self.axis.trap_traj.config.decel_limit = TRAP_DECEL_MAX
+        self._controller_cfg = _odrive_cfg(self.axis.controller)
+        self._trap_traj_cfg = _odrive_cfg(self.axis.trap_traj)
+
+        self._saved_current_soft, self._saved_current_hard = _motor_amp_limits(self.axis)
+        if self._saved_current_soft is not None and self._saved_current_hard is not None:
+            print(
+                f"[steering] motor current_soft_max={self._saved_current_soft:.2f}A  "
+                f"current_hard_max={self._saved_current_hard:.2f}A "
+                f"(PS5 scales soft toward hard under demand)"
+            )
+        else:
+            print(
+                "[steering] motor amp limits not on ``motor.config`` (ODrive 0.6+ layout) — "
+                "skipping dynamic current_soft_max scaling"
+            )
+
+        mode_label = "integrated (trap target slew)" if stick_steering == "integrated" else "absolute"
+        print(f"[steering] mode: POSITION + TRAP_TRAJ — {mode_label}")
+        print(
+            f"[steering] trap_traj vel/accel/decel = "
+            f"{PS5_TRAP_VEL_MAX}/{PS5_TRAP_ACCEL_MAX}/{PS5_TRAP_DECEL_MAX} "
+            f"(same as main.py sweeps)"
+        )
+        self._controller_cfg.control_mode = ControlMode.POSITION_CONTROL
+        self._controller_cfg.input_mode = InputMode.TRAP_TRAJ
+        self._trap_traj_cfg.vel_limit = PS5_TRAP_VEL_MAX
+        self._trap_traj_cfg.accel_limit = PS5_TRAP_ACCEL_MAX
+        self._trap_traj_cfg.decel_limit = PS5_TRAP_DECEL_MAX
 
         self.axis.requested_state = AxisState.CLOSED_LOOP_CONTROL
-        time.sleep(0.3)
+        time.sleep(0.35)
         if self.axis.current_state != AxisState.CLOSED_LOOP_CONTROL:
             raise RuntimeError(
                 f"ODrive failed to enter closed-loop control: "
@@ -345,21 +432,79 @@ class SteeringLink:
             f"(whatever the wheel looks like right now is 0°)"
         )
 
-    def command_deg(self, column_deg: float) -> None:
+    def column_deg_estimate(self) -> float:
+        """Column angle (deg) relative to startup, from encoder."""
+        if self.dry_run or self.axis is None:
+            return 0.0
+        return motor_turns_to_steering_deg(self.axis.pos_estimate - self.start_pos)
+
+    def _apply_dynamic_current(self, demand: float) -> None:
+        """Raise current_soft_max toward hard_max when demand is high (0..1)."""
+        if self.dry_run or self.axis is None:
+            return
+        if self._saved_current_soft is None or self._saved_current_hard is None:
+            return
+        demand = clamp(float(demand), 0.0, 1.0)
+        soft0 = self._saved_current_soft
+        hard = min(self._saved_current_hard, PS5_STEER_CURRENT_HARD_CAP_A)
+        if hard <= soft0 * 1.01:
+            return
+        span = hard - soft0
+        head = PS5_STEER_CURRENT_BLEND_MIN + (1.0 - PS5_STEER_CURRENT_BLEND_MIN) * demand
+        target = soft0 + span * head
+        target = min(hard, max(soft0, target))
+        try:
+            _set_motor_current_soft_max(self.axis, target)
+        except Exception:
+            pass
+
+    def _current_demand(
+        self,
+        lx: float,
+        dlx_dt: float,
+        vel_cmd_motor: float,
+        prev_vel_cmd_motor: float,
+        dt_s: float,
+    ) -> float:
+        a = abs(lx)
+        b = min(1.0, abs(dlx_dt) / STICK_DLX_REF)
+        c = 0.0
+        if dt_s > 1e-6:
+            c = min(1.0, abs(vel_cmd_motor - prev_vel_cmd_motor) / dt_s / VEL_CMD_ACCEL_REF)
+        return max(a, 0.55 * b + 0.55 * c)
+
+    def command_deg(
+        self,
+        column_deg: float,
+        lx: float = 0.0,
+        dlx_dt: float = 0.0,
+        dt_s: float = 1.0 / CONTROL_HZ,
+    ) -> None:
+        """Send column angle (deg) vs startup as a trap-traj ``input_pos`` setpoint."""
         column_deg = clamp(column_deg, -PS5_STEERING_MAX_DEG, PS5_STEERING_MAX_DEG)
         if self.dry_run or self.axis is None:
             return
-        self.axis.controller.input_pos = (
-            self.start_pos + steering_deg_to_motor_turns(column_deg)
+
+        target_motor = steering_deg_to_motor_turns(column_deg)
+        vel_cmd_motor = (target_motor - self._prev_target_motor) / max(dt_s, 1e-6)
+        self._prev_target_motor = target_motor
+
+        self.axis.controller.input_pos = self.start_pos + target_motor
+        dem = self._current_demand(
+            lx, dlx_dt, vel_cmd_motor, self._prev_vel_cmd_motor, dt_s,
         )
+        self._prev_vel_cmd_motor = vel_cmd_motor
+        self._apply_dynamic_current(dem)
 
     def stop(self) -> None:
         if self.dry_run or self.axis is None:
             return
         try:
             self.axis.controller.input_pos = self.start_pos
-            time.sleep(0.3)
-            self.axis.controller.config.input_mode = self._InputMode.PASSTHROUGH
+            time.sleep(0.25)
+            if self._saved_current_soft is not None:
+                _set_motor_current_soft_max(self.axis, self._saved_current_soft)
+            self._controller_cfg.input_mode = self._InputMode.PASSTHROUGH
             self.axis.requested_state = self._AxisState.IDLE
         except Exception as e:
             print(f"[steering] stop failed: {e}")
@@ -403,9 +548,11 @@ def draw_ui(screen, font, font_small, state: dict) -> None:
     screen.blit(sub, (18, 48))
 
     y = 82
+    steer_mode = state.get("stick_steering", "integrated")
+    steer_hint = "trap slew" if steer_mode == "integrated" else "absolute"
     lines = [
         ("steer",
-         f"{state['steer_deg']:+6.1f}°   (stick X {state['lx']:+.2f}, "
+         f"{state['steer_deg']:+6.1f}°   (stick X {state['lx']:+.2f}, {steer_hint}, "
          f"cap ±{PS5_STEERING_MAX_DEG:.0f}°)",
          TEXT if state['control_steering'] else MUTED),
         ("gas target",
@@ -482,6 +629,10 @@ def parse_args() -> argparse.Namespace:
         "--dry-run", action="store_true",
         help="Don't open the ODrive or serial port — just read inputs and draw the UI.",
     )
+    parser.add_argument(
+        "--stick-steering", choices=STICK_STEERING, default="integrated",
+        help="integrated = trap-traj target slew (hold at release); absolute = stick maps to angle.",
+    )
     return parser.parse_args()
 
 
@@ -499,6 +650,7 @@ def main() -> int:
         f"PS5_GAS_LIMIT={PS5_GAS_LIMIT})"
     )
     print(f"[mode] {args.mode}: steering={control_steering}, pedals={control_pedals}")
+    print(f"[stick-steering] {args.stick_steering}")
 
     js = init_controller(args.index)
 
@@ -510,14 +662,31 @@ def main() -> int:
         if control_pedals:
             pedals = PedalLink(args.arduino_port, dry_run=args.dry_run)
         if control_steering:
-            steering = SteeringLink(dry_run=args.dry_run)
+            steering = SteeringLink(
+                dry_run=args.dry_run, stick_steering=args.stick_steering,
+            )
 
         screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
-        pygame.display.set_caption(f"PS5 drive — {args.mode}")
+        pygame.display.set_caption(
+            f"PS5 drive — {args.mode} ({args.stick_steering} steer)"
+        )
         clock = pygame.time.Clock()
         font = pygame.font.SysFont("Menlo", 22, bold=True)
         font_small = pygame.font.SysFont("Menlo", 14)
 
+        steer_target_deg = 0.0
+        if (
+            args.stick_steering == "integrated"
+            and control_steering
+            and steering is not None
+            and not steering.dry_run
+        ):
+            # Match trap target to the column angle at launch so we do not
+            # command a jump toward 0° while the wheel is already offset.
+            steer_target_deg = steering.column_deg_estimate()
+
+        prev_lx = 0.0
+        last_mono = time.monotonic()
         running = True
         while running:
             for event in pygame.event.get():
@@ -530,11 +699,39 @@ def main() -> int:
                     running = False
 
             lx_raw = js.get_axis(AXIS_LEFT_X) if js.get_numaxes() > AXIS_LEFT_X else 0.0
-            lx = apply_deadzone(lx_raw, STICK_DEADZONE)
+            lx = apply_deadzone(lx_raw, STEER_STICK_DEADZONE)
             l2 = read_trigger(js, AXIS_L2, TRIGGER_MAX_L2)
             r2 = read_trigger(js, AXIS_R2, TRIGGER_MAX_R2)
 
-            steer_deg = lx * PS5_STEERING_MAX_DEG
+            now = time.monotonic()
+            dt_s = now - last_mono
+            last_mono = now
+            if dt_s <= 0.0 or dt_s > 0.25:
+                dt_s = 1.0 / CONTROL_HZ
+
+            raw_dlx = (lx - prev_lx) / dt_s if dt_s > 0 else 0.0
+            dlx_dt = clamp(raw_dlx, -28.0, 28.0)
+
+            if args.stick_steering == "integrated":
+                steer_target_deg += lx * STEER_INTEGRATE_RATE_DPS * dt_s
+                steer_target_deg = clamp(
+                    steer_target_deg,
+                    -PS5_STEERING_MAX_DEG,
+                    PS5_STEERING_MAX_DEG,
+                )
+                if (
+                    control_steering
+                    and steering is not None
+                    and not steering.dry_run
+                ):
+                    steer_deg = steering.column_deg_estimate()
+                else:
+                    steer_deg = steer_target_deg
+            else:
+                steer_deg = lx * PS5_STEERING_MAX_DEG
+
+            prev_lx = lx
+
             gas = r2 * gas_cap
             brake = l2 * BRAKE_POT_MAX
 
@@ -552,13 +749,19 @@ def main() -> int:
                     running = False
 
             if running and control_steering and steering is not None:
-                steering.command_deg(steer_deg)
+                cmd_deg = (
+                    steer_target_deg
+                    if args.stick_steering == "integrated"
+                    else steer_deg
+                )
+                steering.command_deg(cmd_deg, lx=lx, dlx_dt=dlx_dt, dt_s=dt_s)
 
             draw_ui(screen, font, font_small, {
                 "mode": args.mode,
                 "dry_run": args.dry_run,
                 "control_steering": control_steering,
                 "control_pedals": control_pedals,
+                "stick_steering": args.stick_steering,
                 "lx": lx, "l2": l2, "r2": r2,
                 "steer_deg": steer_deg,
                 "gas": gas, "brake": brake,
