@@ -19,9 +19,17 @@ from odrive.enums import AxisState, InputMode
 import time
 import sys
 
+from limits import (
+    STEERING_BELT_RATIO as BELT_RATIO,
+    STEERING_MAX_DEG,
+    STEERING_MIN_DEG,
+    steering_deg_to_motor_turns as deg_to_motor_turns,
+    motor_turns_to_steering_deg as motor_turns_to_deg,
+)
+
 # --- Configuration ---
-BELT_RATIO = 3.0           # 20T motor pulley to 60T column pulley
-MAX_ANGLE_DEG = 90.0       # sweep to ±90°
+# Sweep amplitude is clamped to the soft steering limits from limits.py.
+MAX_ANGLE_DEG = min(STEERING_MAX_DEG, -STEERING_MIN_DEG)
 NUM_SWEEPS = 5             # number of full left-right sweeps
 POSITION_THRESHOLD = 0.01  # turns - how close is "arrived"
 
@@ -29,17 +37,6 @@ POSITION_THRESHOLD = 0.01  # turns - how close is "arrived"
 TRAP_VEL_MAX    = 8.0      # turns/s  — peak cruise speed (sweep 5)
 TRAP_ACCEL_MAX  = 15.0     # turns/s² — acceleration (sweep 5)
 TRAP_DECEL_MAX  = 15.0     # turns/s² — deceleration (sweep 5)
-
-def deg_to_motor_turns(wheel_degrees: float) -> float:
-    """Convert steering wheel degrees to motor turns, accounting for belt ratio."""
-    wheel_turns = wheel_degrees / 360.0
-    motor_turns = wheel_turns * BELT_RATIO
-    return motor_turns
-
-def motor_turns_to_deg(motor_turns: float) -> float:
-    """Convert motor turns back to steering wheel degrees."""
-    wheel_turns = motor_turns / BELT_RATIO
-    return wheel_turns * 360.0
 
 def wait_for_position(axis, target_pos: float, timeout: float = 10.0):
     """Wait until the motor reaches the target position or timeout."""
