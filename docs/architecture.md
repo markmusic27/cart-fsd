@@ -2,7 +2,7 @@
 
 How the cart's software is organized today, where it's going, and the cross-cutting rules (limits hierarchy, safety layers) that every subsystem has to respect.
 
-For per-subsystem detail see [`steering.md`](./steering.md), [`linear_actuators.md`](./linear_actuators.md), [`estop.md`](./estop.md), [`gps.md`](./gps.md), [`cameras.md`](./cameras.md), and [`ps5_drive.md`](./ps5_drive.md).
+For per-subsystem detail see [`steering.md`](./steering.md), [`linear_actuators.md`](./linear_actuators.md), [`estop.md`](./estop.md), [`gps.md`](./gps.md), [`imu.md`](./imu.md), [`cameras.md`](./cameras.md), and [`ps5_drive.md`](./ps5_drive.md).
 
 ---
 
@@ -37,7 +37,9 @@ cart-fsd/
 ├── sketches/
 │   ├── common/cart_limits.h       # C mirror of limits.py
 │   ├── pedal_control/             # gas + brake firmware w/ heartbeat watchdog
-│   └── sensor_validation/         # GPS NMEA passthrough
+│   ├── sensor_validation/         # GPS NMEA passthrough
+│   ├── imu_validation/            # IMU I2C bus scanner
+│   └── brake_jog/                 # bench-only brake actuator jog (F/B/S over serial)
 └── docs/
 ```
 

@@ -50,21 +50,27 @@ The GT-U7 has a single red LED with two distinct states — worth knowing before
 
 The current firmware is a **pure passthrough** — the Mega forwards bytes in both directions between `Serial1` (GPS) and `Serial` (USB). We're not parsing NMEA on the Mega yet; the host handles that. This is intentionally minimal while we validate the chain end-to-end.
 
-Files:
+Two halves, two files:
 
-| File                                               | Purpose                                               |
-|----------------------------------------------------|-------------------------------------------------------|
-| `sketches/sensor_validation/sensor_validation.ino` | Arduino passthrough sketch (GPS ↔ USB).               |
-| `scripts/sensor_test.py`                           | Host-side NMEA parser + fix reporter via `pynmea2`.   |
+| File                                               | Purpose                                                                 |
+|----------------------------------------------------|-------------------------------------------------------------------------|
+| `sketches/sensor_validation/sensor_validation.ino` | Mega passthrough sketch (GPS ↔ USB). Compiled + flashed by `scripts/upload.py`. |
+| `scripts/sensor_test.py`                           | Host-side NMEA parser + fix reporter via `pynmea2`.                     |
 
-### Usage
+### How to test the GPS
 
-1. Upload `sketches/sensor_validation/sensor_validation.ino` to the Mega (Arduino IDE, board = `Arduino Mega 2560`).
-2. Close the IDE's Serial Monitor (or anything else holding the port).
-3. From the project root:
+The whole flow runs from the project root, no Arduino IDE involved. `scripts/upload.py` is the script that compiles and flashes the `.ino` file — see [`architecture.md` § Firmware workflow](./architecture.md#firmware-workflow-no-arduino-ide).
+
+1. **Connect** the GPS as in the [wiring table](#wiring). The red LED should be **solid on** as soon as power is applied.
+2. **Compile and flash** the passthrough sketch to the Mega:
+   ```bash
+   uv run python scripts/upload.py sensor_validation
+   ```
+3. **Run the host-side reader** to parse NMEA:
    ```bash
    uv run python scripts/sensor_test.py
    ```
+   Don't have anything else holding the port at the same time (the Arduino IDE's Serial Monitor, a stray `arduino-cli monitor`, etc.). macOS only allows one process to own a `/dev/cu.usbmodem*` device.
 
 You should see something like:
 
@@ -76,7 +82,16 @@ You should see something like:
 --- 5s | GPS: 29 valid @ 5.8/s ---
 ```
 
-Once the antenna has sky view, the `NO FIX` transitions to `GPS FIX` and `lat` / `lon` / `alt` populate. At that point the red LED on the module also switches from solid to blinking.
+What each line tells you:
+
+| Line                                | Means                                                                |
+|-------------------------------------|----------------------------------------------------------------------|
+| `INFO,…starting`                    | Mega is running the GPS validation sketch (not some other firmware). |
+| `--- 5s | GPS: N valid @ X/s ---`   | NMEA is reaching the host: power + TX/RX + baud all correct. ✅       |
+| `NO FIX  sats=0  lat=0  lon=0`      | GPS is healthy but has no satellites yet — expected indoors.         |
+| `--- 5s | GPS: 0 valid @ 0.0/s ---` | Bytes aren't reaching the host. Reflash, then check wiring.          |
+
+Once the antenna has sky view, `NO FIX` transitions to `GPS FIX` and `lat` / `lon` / `alt` populate. At that point the red LED on the module also switches from solid to blinking.
 
 ### Useful flags
 
@@ -86,6 +101,15 @@ uv run python scripts/sensor_test.py --port /dev/cu.usbmodem1401 # force specifi
 ```
 
 The port picker auto-selects the Arduino's VID (`0x2341`) and explicitly **refuses to pick the ODrive S1** (VID `0x1209`), so plugging both in at once is safe.
+
+### Common failure modes
+
+| Symptom                                                | Cause                                                                                       |
+|--------------------------------------------------------|---------------------------------------------------------------------------------------------|
+| `Resource busy` on port open                           | Arduino IDE Serial Monitor (or another script) is holding the port. Close it and retry.    |
+| `GPS: 0 valid` but boot banner is the GPS sketch       | Wiring problem. TX/RX swapped is the most common — check `docs/gps.md`'s wire colors.       |
+| Boot banner is something else (e.g. `brake actuator …`)| Mega's flash holds a different sketch — re-run `scripts/upload.py sensor_validation`.       |
+| `NO FIX sats=0` indefinitely                           | Indoors with no sky view. Take it outside or to a windowsill — see [Cold-start](#cold-start-behavior). |
 
 ---
 
