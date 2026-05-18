@@ -1,0 +1,133 @@
+# SimLingo fine-tuning on NVIDIA PhysicalAI-AV real-world data
+#
+# This config is optimized for warm-starting from SimLingo and fine-tuning
+# with LoRA on real-world driving data.
+#
+# Usage:
+#   modal run modal_training.py::train --config config/nvidia_finetune.yaml
+
+model:
+  # Warm start from pretrained SimLingo
+  base: "RenzKa/simlingo"
+  backbone: "OpenGVLab/InternVL2-1B"
+
+  # Prediction heads
+  num_waypoints: 11
+  waypoint_spacing_s: 0.25
+  route_points: 20
+  route_spacing_m: 1.0
+
+training:
+  # Batch configuration
+  batch_size: 64
+  gradient_accumulation_steps: 2
+  effective_batch_size: 128  # batch_size * gradient_accumulation_steps
+
+  # Training duration
+  epochs: 20
+  max_steps: null  # If set, overrides epochs
+
+  # Optimizer settings (lower LR than SimLingo's 3e-5 for fine-tuning)
+  learning_rate: 1.0e-5
+  lr_scheduler: cosine
+  warmup_ratio: 0.05
+  warmup_steps: null  # If set, overrides warmup_ratio
+
+  optimizer: adamw
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+  # Precision and memory
+  precision: bf16
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+
+  # Evaluation
+  eval_steps: 500
+  save_steps: 500
+  logging_steps: 10
+
+  # Early stopping
+  early_stopping: false
+  early_stopping_patience: 5
+  early_stopping_metric: val/loss
+
+lora:
+  enabled: true
+  rank: 32
+  alpha: 64
+  dropout: 0.1
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+  # Optional: fine-tune vision encoder as well
+  vision_lora: false
+  vision_rank: 16
+
+data:
+  # Paths (will be set by training script)
+  train_dir: null  # e.g., /nvidia_data/extracted
+  val_dir: null    # If null, uses val split from train_dir
+  val_split: 0.1
+
+  # Image preprocessing
+  image_size: [448, 448]  # InternVL2 input size
+  crop_bottom: false      # NVIDIA cameras are roof-mounted
+
+  # Camera configuration (NVIDIA front wide 120° FOV)
+  fov_deg: 120.0
+  use_intrinsics: true  # Use actual intrinsics from data if available
+
+  # Data augmentation (conservative for real-world data)
+  augmentation:
+    enabled: true
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.1
+    hue: 0.05
+    # No geometric augmentation - waypoints would need adjustment
+
+  # Waypoint configuration
+  num_waypoints: 11
+  waypoint_spacing_s: 0.25
+
+  # DataLoader settings
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+
+loss:
+  # Waypoint loss (primary)
+  waypoint_loss: smooth_l1
+  waypoint_weight: 1.0
+
+  # Route loss
+  route_loss: smooth_l1
+  route_weight: 0.5
+
+  # Language loss (optional, for meta-actions)
+  language_loss: cross_entropy
+  language_weight: 0.0  # Set to 1.0 when using language labels
+
+wandb:
+  project: "simlingo-nvidia-finetune"
+  entity: null  # Will use default entity
+  log_interval: 10
+  save_artifacts: true
+
+# HuggingFace Hub settings
+hub:
+  push_to_hub: false
+  repo_id: null  # e.g., "your-username/simlingo-nvidia"
+  private: true
+
+# Distributed training settings
+distributed:
+  strategy: ddp  # or fsdp for larger models
+  find_unused_parameters: false
+
+# Seed for reproducibility
+seed: 42
