@@ -40,10 +40,16 @@ HF_DATA_FILES = [
     "commentary_simlingo_validation_1_scenario_routes_validation_random_weather_seed_2_balanced_150_chunk_001.tar.gz",
 ]
 
+# nuScenes Mini (real-world urban driving, 10 scenes, ~4 GB). Mirrored from
+# the official nuTonomy/Motional S3 bucket.
+NUSCENES_MINI_URL = "https://www.nuscenes.org/data/v1.0-mini.tgz"
+NUSCENES_VERSION = "v1.0-mini"
+
 # Volume mountpoints.
 CACHE_DIR = "/cache"
 DATA_DIR = "/data"
 OUTPUTS_DIR = "/outputs"
+NUSCENES_DIR = "/nuscenes"
 EXTRACTED_DIR = f"{DATA_DIR}/extracted"
 CKPT_DIR = f"{DATA_DIR}/checkpoint"
 
@@ -110,6 +116,12 @@ simlingo_image = (
         "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.0.post2/flash_attn-2.7.0.post2+cu12torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
     )
     .pip_install("deepspeed==0.16.2")
+    # nuScenes adapter deps. Kept in their own pip layer so editing this list
+    # doesn't invalidate the big torch/flash-attn caches above.
+    .pip_install(
+        "nuscenes-devkit==1.1.11",
+        "pyquaternion==0.9.9",
+    )
     .run_commands(
         f"git clone --depth 1 {SIMLINGO_REPO_URL} {SIMLINGO_REPO_DIR}",
         # Pin to a known-good commit so reruns are reproducible.
@@ -139,11 +151,15 @@ simlingo_image = (
 cache_volume = modal.Volume.from_name("simlingo-cache", create_if_missing=True)
 data_volume = modal.Volume.from_name("simlingo-data", create_if_missing=True)
 output_volume = modal.Volume.from_name("simlingo-outputs", create_if_missing=True)
+# Keep nuScenes on its own volume so its inode footprint doesn't compete with
+# the CARLA chunk (which is already at 90% of the default 500k inode quota).
+nuscenes_volume = modal.Volume.from_name("simlingo-nuscenes", create_if_missing=True)
 
 VOLUMES = {
     CACHE_DIR: cache_volume,
     DATA_DIR: data_volume,
     OUTPUTS_DIR: output_volume,
+    NUSCENES_DIR: nuscenes_volume,
 }
 
 # ---------------------------------------------------------------------------
@@ -291,6 +307,262 @@ def run(
     print(">> metrics:", summary["metrics"], flush=True)
     print(f">> wrote {summary['num_written']} overlays to {out_dir}", flush=True)
     return summary
+
+
+@app.function(
+    image=simlingo_image,
+    volumes=VOLUMES,
+    gpu="L4",
+    timeout=60 * 60,
+    cpu=4,
+    memory=24 * 1024,
+)
+def run_video(
+    num_frames: int = 200,
+    fps: int = 20,
+    use_cot: bool = True,
+    seed: int = 0,
+) -> dict:
+    """Run inference on a contiguous span of validation frames and stitch the
+    overlays into an mp4. Useful as a qualitative sanity check + Hz benchmark.
+    """
+    sys.path.insert(0, SIMLINGO_REPO_DIR)
+    sys.path.insert(0, os.path.dirname(__file__))
+
+    from scripts import inference
+
+    ckpt_path = str(Path(CKPT_DIR) / HF_CKPT_FILE)
+    hydra_cfg_path = str(Path(CKPT_DIR) / HF_HYDRA_CONFIG_FILE)
+    data_root = EXTRACTED_DIR
+    out_dir = Path(OUTPUTS_DIR) / f"video_n{num_frames}_fps{fps}_s{seed}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    summary = inference.run_video_inference(
+        ckpt_path=ckpt_path,
+        hydra_cfg_path=hydra_cfg_path,
+        data_root=data_root,
+        out_dir=str(out_dir),
+        num_frames=num_frames,
+        fps=fps,
+        use_cot=use_cot,
+        seed=seed,
+    )
+
+    output_volume.commit()
+
+    print(">> video timing:", summary["timing"], flush=True)
+    print(f">> wrote video to {summary['video_path']}", flush=True)
+    return summary
+
+
+@app.function(
+    image=simlingo_image,
+    volumes=VOLUMES,
+    timeout=60 * 60 * 2,  # 2h — the tgz is ~4 GB
+    cpu=4,
+)
+def prepare_nuscenes_mini(force: bool = False) -> dict:
+    """One-time download + extraction of the nuScenes Mini set (~4 GB)."""
+    print(">> preparing nuScenes mini", flush=True)
+    dest_root = Path(NUSCENES_DIR)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    meta_dir = dest_root / NUSCENES_VERSION
+    samples_dir = dest_root / "samples"
+    if meta_dir.exists() and samples_dir.exists() and not force:
+        print("  already extracted; skipping", flush=True)
+        out = subprocess.check_output(["du", "-sh", str(dest_root)], text=True)
+        return {"ok": True, "skipped": True, "inventory": out.strip()}
+
+    tgz_path = dest_root / "downloads" / "v1.0-mini.tgz"
+    tgz_path.parent.mkdir(parents=True, exist_ok=True)
+    if not tgz_path.exists() or force:
+        print(f"  downloading: {NUSCENES_MINI_URL}", flush=True)
+        # Stream over HTTPS and write straight to the volume so we never need
+        # to buffer the 4 GB archive in RAM. Abort if the response isn't 200.
+        import time as _time
+        import urllib.request
+
+        req = urllib.request.Request(
+            NUSCENES_MINI_URL,
+            headers={"User-Agent": "simlingo-sandbox/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"unexpected HTTP {resp.status} for {NUSCENES_MINI_URL}")
+            total = int(resp.headers.get("Content-Length", "0"))
+            written = 0
+            last_log = 0.0
+            with open(tgz_path, "wb") as fh:
+                while True:
+                    chunk = resp.read(1024 * 1024)  # 1 MiB
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    written += len(chunk)
+                    now = _time.time()
+                    if now - last_log > 5:
+                        pct = (written / total * 100) if total else 0
+                        print(
+                            f"    downloaded {written/1e9:.2f} GB "
+                            f"({pct:.1f}%)",
+                            flush=True,
+                        )
+                        last_log = now
+        print(f"    downloaded {written/1e9:.2f} GB (complete)", flush=True)
+    else:
+        print(f"  cached: {tgz_path}", flush=True)
+
+    print(f"  extract: {tgz_path} -> {dest_root}", flush=True)
+    import tarfile
+
+    with tarfile.open(tgz_path, "r:gz") as tf:
+        tf.extractall(dest_root)
+
+    nuscenes_volume.commit()
+
+    inv = subprocess.check_output(["du", "-sh", str(dest_root)], text=True).strip()
+    print(inv, flush=True)
+    return {"ok": True, "inventory": inv, "dataroot": str(dest_root)}
+
+
+@app.function(
+    image=simlingo_image,
+    volumes=VOLUMES,
+    gpu="L4",
+    timeout=60 * 60,
+    cpu=4,
+    memory=24 * 1024,
+)
+def run_on_nuscenes(
+    num_samples: int = 32,
+    frame_stride: int = 4,
+    use_cot: bool = True,
+    save_overlays: bool = True,
+    seed: int = 0,
+    scene_filter: str | None = None,
+) -> dict:
+    """Run SimLingo on the nuScenes Mini front camera.
+
+    Args:
+        num_samples: total frames to evaluate across all scenes.
+        frame_stride: subsample within each scene (1 = every keyframe ~0.5s).
+        scene_filter: comma-separated scene tokens. Default = all 10 mini scenes.
+    """
+    sys.path.insert(0, SIMLINGO_REPO_DIR)
+    sys.path.insert(0, os.path.dirname(__file__))
+
+    from scripts import inference, nuscenes_loader
+
+    ckpt_path = str(Path(CKPT_DIR) / HF_CKPT_FILE)
+    hydra_cfg_path = str(Path(CKPT_DIR) / HF_HYDRA_CONFIG_FILE)
+    out_dir = Path(OUTPUTS_DIR) / f"nuscenes_n{num_samples}_s{seed}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_iter = nuscenes_loader.iter_nuscenes_samples(
+        dataroot=NUSCENES_DIR,
+        version=NUSCENES_VERSION,
+        max_samples=num_samples,
+        frame_stride=frame_stride,
+        scene_filter=(scene_filter.split(",") if scene_filter else None),
+    )
+
+    # Materialise the iterator so we can report a count and so any nuscenes-devkit
+    # crash surfaces before model load.
+    samples = list(sample_iter)
+    print(f">> nuScenes samples ready: {len(samples)}", flush=True)
+
+    summary = inference.run_external_samples(
+        ckpt_path=ckpt_path,
+        hydra_cfg_path=hydra_cfg_path,
+        out_dir=str(out_dir),
+        samples=samples,
+        use_cot=use_cot,
+        save_overlays=save_overlays,
+        label="nuscenes",
+    )
+
+    output_volume.commit()
+    print(">> metrics:", summary["metrics"], flush=True)
+    print(f">> wrote {summary['num_written']} overlays to {out_dir}", flush=True)
+    return summary
+
+
+@app.function(
+    image=simlingo_image,
+    volumes=VOLUMES,
+    gpu="L4",
+    timeout=60 * 60,
+    cpu=4,
+    memory=24 * 1024,
+)
+def video_on_nuscenes(
+    scenes: str = "scene-0061,scene-0103",
+    fps: int = 12,
+    max_frames: int = 360,
+    use_cot: bool = True,
+    label: str = "nuscenes_video",
+) -> dict:
+    """Run SimLingo on the full ~12 Hz CAM_FRONT sample_data of one or more
+    nuScenes Mini scenes and stitch the overlays into an MP4.
+
+    Defaults to ~30s of playback at 12 fps: 360 frames across two scenes.
+    """
+    sys.path.insert(0, SIMLINGO_REPO_DIR)
+    sys.path.insert(0, os.path.dirname(__file__))
+
+    from scripts import inference, nuscenes_loader
+    from scripts.inference import _stitch_video
+
+    ckpt_path = str(Path(CKPT_DIR) / HF_CKPT_FILE)
+    hydra_cfg_path = str(Path(CKPT_DIR) / HF_HYDRA_CONFIG_FILE)
+    out_dir = Path(OUTPUTS_DIR) / f"{label}_n{max_frames}_fps{fps}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    scene_names = [s.strip() for s in scenes.split(",") if s.strip()]
+    print(f">> collecting nuScenes video frames from: {scene_names}", flush=True)
+    samples = list(
+        nuscenes_loader.iter_nuscenes_video_frames(
+            dataroot=NUSCENES_DIR,
+            version=NUSCENES_VERSION,
+            scene_names=scene_names,
+            max_frames=max_frames,
+        )
+    )
+    print(f"   collected {len(samples)} frames", flush=True)
+    if not samples:
+        raise RuntimeError(
+            f"no nuScenes frames matched scene_names={scene_names!r}"
+        )
+
+    summary = inference.run_external_samples(
+        ckpt_path=ckpt_path,
+        hydra_cfg_path=hydra_cfg_path,
+        out_dir=str(out_dir),
+        samples=samples,
+        use_cot=use_cot,
+        save_overlays=True,
+        label=label,
+    )
+
+    overlays_dir = out_dir / "overlays"
+    overlay_paths = sorted(overlays_dir.glob("*.png"))
+    if not overlay_paths:
+        raise RuntimeError(f"no overlays were produced in {overlays_dir}")
+    video_path = out_dir / "predictions.mp4"
+    print(f">> stitching {len(overlay_paths)} frames -> {video_path}", flush=True)
+    _stitch_video(overlay_paths, video_path, fps=fps)
+    seconds = len(overlay_paths) / max(fps, 1)
+    print(f"   wrote {video_path} ({seconds:.1f}s at {fps} fps)", flush=True)
+
+    output_volume.commit()
+
+    return {
+        **summary,
+        "video_path": str(video_path),
+        "fps": fps,
+        "duration_s": seconds,
+        "scenes": scene_names,
+    }
 
 
 @app.function(image=simlingo_image, volumes=VOLUMES, timeout=600)

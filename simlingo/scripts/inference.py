@@ -80,6 +80,60 @@ def _find_route_dirs(data_root: str) -> list[Path]:
     return sorted({Path(c).parent for c in candidates})
 
 
+def _collect_video_samples(
+    data_root: str,
+    num_frames: int,
+    pred_len: int = 11,
+    seed: int = 0,
+) -> list[FrameSample]:
+    """Pick `num_frames` consecutive usable frames from a single route.
+
+    We need contiguous frames so the resulting video plays back as real-time
+    driving footage. Returns an empty list if no route is long enough.
+    """
+    routes = _find_route_dirs(data_root)
+    print(f"  found {len(routes)} route dirs under {data_root}", flush=True)
+    rng = random.Random(seed)
+    rng.shuffle(routes)
+
+    for route_dir in routes:
+        rgb_dir = route_dir / "rgb"
+        meas_dir = route_dir / "measurements"
+        if not (rgb_dir.exists() and meas_dir.exists()):
+            continue
+        frame_files = sorted(rgb_dir.glob("[0-9][0-9][0-9][0-9].jpg"))
+        usable = [
+            int(p.stem)
+            for p in frame_files
+            if (meas_dir / f"{int(p.stem) + pred_len:04d}.json.gz").exists()
+        ]
+        if len(usable) < num_frames:
+            continue
+        # Find the first run of `num_frames` strictly-consecutive indices.
+        run_start = 0
+        for k in range(1, len(usable)):
+            if usable[k] != usable[k - 1] + 1:
+                run_start = k
+            if k - run_start + 1 >= num_frames:
+                chosen = usable[run_start : run_start + num_frames]
+                print(
+                    f"  using route {route_dir.name} frames "
+                    f"{chosen[0]}..{chosen[-1]} ({num_frames} consecutive)",
+                    flush=True,
+                )
+                return [
+                    FrameSample(
+                        route_dir=route_dir,
+                        frame_idx=idx,
+                        rgb_path=rgb_dir / f"{idx:04d}.jpg",
+                        measurements_dir=meas_dir,
+                        commentary_path=_commentary_path_for(route_dir, idx),
+                    )
+                    for idx in chosen
+                ]
+    return []
+
+
 def _collect_samples(
     data_root: str,
     num_samples: int,
@@ -438,6 +492,89 @@ def _implied_speed(wps: np.ndarray, wp_freq: int = 5, carla_fps: int = 20) -> fl
 # ---------------------------------------------------------------------------
 
 
+def _setup_model_and_tokens(
+    ckpt_path: str,
+    hydra_cfg_path: str,
+):
+    """Common bootstrap: patch sys.path, load model + tokenizer + cfg, and
+    compute the number of image tokens the prompt expects.
+
+    Returns (model, tokenizer, cfg, num_image_tokens_total, use_global_img,
+    device).
+    """
+    sys.path.insert(0, "/opt/simlingo")
+    _ensure_internvl_pretrained_symlink()
+
+    from simlingo_training.utils.internvl2_utils import get_num_image_tokens_per_patch
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f">> device: {device}", flush=True)
+    print(">> loading model", flush=True)
+    t0 = time.time()
+    model, tokenizer, cfg = _load_model(ckpt_path, hydra_cfg_path, device)
+    print(f"   loaded in {time.time() - t0:.1f}s", flush=True)
+
+    use_global_img = bool(cfg.data_module.use_global_img)
+    NUM_IMAGE_PATCHES = 2
+    num_image_tokens_total = (
+        get_num_image_tokens_per_patch(cfg.model.vision_model.variant) * NUM_IMAGE_PATCHES
+    )
+    return model, tokenizer, cfg, num_image_tokens_total, use_global_img, device
+
+
+def _predict_one(
+    *,
+    model,
+    tokenizer,
+    cfg,
+    device: torch.device,
+    use_global_img: bool,
+    num_image_tokens_total: int,
+    rgb_path: Path,
+    speed_mps: float,
+    target_points: np.ndarray,
+    use_cot: bool,
+) -> tuple[np.ndarray | None, np.ndarray | None, str, tuple[int, int]]:
+    """Run the model on a single (image, speed, target_points) tuple.
+
+    Returns (pred_wps, pred_route_1m, pred_text, (H, W)) where the image
+    dimensions are after the bonnet crop done by `_process_image`.
+    """
+    pixel_values, HW = _process_image(rgb_path, use_global_img=use_global_img)
+
+    prompt_text = _build_prompt(speed_mps, use_cot=use_cot)
+    prompt_ll, prompt_inf_ll = _build_language_label(
+        prompt_text,
+        target_points_np=target_points,
+        tokenizer=tokenizer,
+        encoder_variant=cfg.model.vision_model.variant,
+        num_image_tokens_total=num_image_tokens_total,
+        device=device,
+    )
+
+    driving_input = _build_driving_input(
+        pixel_values,
+        speed_mps=speed_mps,
+        target_points_np=target_points,
+        prompt_ll=prompt_ll,
+        prompt_inference_ll=prompt_inf_ll,
+        HW=HW,
+        device=device,
+    )
+
+    with torch.inference_mode():
+        speed_wps, route_wps, language = model(driving_input)
+
+    pred_wps = speed_wps[0].float().cpu().numpy() if speed_wps is not None else None
+    pred_route = (
+        _equal_spacing_route(route_wps[0].float().cpu().numpy(), num=20)
+        if route_wps is not None
+        else None
+    )
+    pred_text = language[0] if language else ""
+    return pred_wps, pred_route, pred_text, HW
+
+
 def run_inference(
     *,
     ckpt_path: str,
@@ -450,29 +587,10 @@ def run_inference(
     save_overlays: bool,
     seed: int,
 ) -> dict[str, Any]:
-    sys.path.insert(0, "/opt/simlingo")
-    _ensure_internvl_pretrained_symlink()
-
-    # Heavy imports happen after we've patched sys.path + cwd.
-    from simlingo_training.utils.internvl2_utils import get_num_image_tokens_per_patch
-
     from . import viz  # local
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f">> device: {device}", flush=True)
-    print(">> loading model", flush=True)
-    t0 = time.time()
-    model, tokenizer, cfg = _load_model(ckpt_path, hydra_cfg_path, device)
-    print(f"   loaded in {time.time() - t0:.1f}s", flush=True)
-
-    use_global_img = bool(cfg.data_module.use_global_img)
-    # Upstream `DataModule` and `team_code/agent_simlingo.py` both hardcode
-    # NUM_IMAGE_PATCHES=2 here regardless of `use_global_img` (the thumbnail,
-    # when present, is consumed inside the vision encoder, not surfaced as
-    # extra context tokens in the prompt).
-    NUM_IMAGE_PATCHES = 2
-    num_image_tokens_total = (
-        get_num_image_tokens_per_patch(cfg.model.vision_model.variant) * NUM_IMAGE_PATCHES
+    model, tokenizer, cfg, num_image_tokens_total, use_global_img, device = (
+        _setup_model_and_tokens(ckpt_path, hydra_cfg_path)
     )
 
     print(">> collecting samples", flush=True)
@@ -511,41 +629,18 @@ def run_inference(
                 np.asarray(current["route"], dtype=np.float32)
             )
 
-            pixel_values, HW = _process_image(s.rgb_path, use_global_img=use_global_img)
-
-            prompt_text = _build_prompt(speed_mps, use_cot=use_cot)
-            prompt_ll, prompt_inf_ll = _build_language_label(
-                prompt_text,
-                target_points_np=target_points,
+            pred_wps, pred_route, pred_text, _ = _predict_one(
+                model=model,
                 tokenizer=tokenizer,
-                encoder_variant=cfg.model.vision_model.variant,
+                cfg=cfg,
+                device=device,
+                use_global_img=use_global_img,
                 num_image_tokens_total=num_image_tokens_total,
-                device=device,
-            )
-
-            driving_input = _build_driving_input(
-                pixel_values,
+                rgb_path=s.rgb_path,
                 speed_mps=speed_mps,
-                target_points_np=target_points,
-                prompt_ll=prompt_ll,
-                prompt_inference_ll=prompt_inf_ll,
-                HW=HW,
-                device=device,
+                target_points=target_points,
+                use_cot=use_cot,
             )
-
-            with torch.inference_mode():
-                speed_wps, route_wps, language = model(driving_input)
-
-            pred_wps = speed_wps[0].float().cpu().numpy() if speed_wps is not None else None
-            # Upstream `predict_step` resamples the predicted route onto a 1m
-            # grid before computing metrics — replicate that so ADE/FDE on the
-            # path is comparable to the dataset's `route_adjusted` GT.
-            pred_route = (
-                _equal_spacing_route(route_wps[0].float().cpu().numpy(), num=20)
-                if route_wps is not None
-                else None
-            )
-            pred_text = language[0] if language else ""
 
             ade_wp, fde_wp = (
                 _ade_fde(pred_wps, gt_wps)
@@ -579,7 +674,7 @@ def run_inference(
                 "implied_speed_gt": _implied_speed(gt_wps),
                 "pred_commentary": pred_text,
                 "gt_commentary": gt_commentary,
-                "prompt": prompt_text,
+                "prompt": _build_prompt(speed_mps, use_cot=use_cot),
             }
             per_sample.append(entry)
 
@@ -618,6 +713,406 @@ def run_inference(
     }
     with open(out_dir_p / "predictions.json", "w") as fh:
         json.dump({"summary": summary, "per_sample": per_sample}, fh, indent=2, default=str)
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Generic per-sample driver (CARLA-free) — used for nuScenes and later the cart
+# ---------------------------------------------------------------------------
+
+
+def run_external_samples(
+    *,
+    ckpt_path: str,
+    hydra_cfg_path: str,
+    out_dir: str,
+    samples: Iterable[Any],
+    use_cot: bool,
+    save_overlays: bool,
+    label: str = "external",
+) -> dict[str, Any]:
+    """Run the model on an arbitrary stream of `ExternalSample` objects.
+
+    `samples` must yield objects with at least:
+        rgb_path, speed_mps, target_points; optionally gt_wps, gt_route,
+        gt_commentary, intrinsics, fov_deg, cam_translation_xyz, crop_bottom,
+        meta.
+    Defined in scripts/nuscenes_loader.py::ExternalSample.
+    """
+    from . import viz  # local
+
+    model, tokenizer, cfg, num_image_tokens_total, use_global_img, device = (
+        _setup_model_and_tokens(ckpt_path, hydra_cfg_path)
+    )
+
+    out_dir_p = Path(out_dir)
+    out_dir_p.mkdir(parents=True, exist_ok=True)
+    overlays_dir = out_dir_p / "overlays"
+    if save_overlays:
+        overlays_dir.mkdir(exist_ok=True)
+
+    per_sample: list[dict] = []
+    n_written = 0
+    print(f">> running {label} inference", flush=True)
+    for i, s in enumerate(samples):
+        try:
+            pred_wps, pred_route, pred_text, _ = _predict_one(
+                model=model,
+                tokenizer=tokenizer,
+                cfg=cfg,
+                device=device,
+                use_global_img=use_global_img,
+                num_image_tokens_total=num_image_tokens_total,
+                rgb_path=s.rgb_path,
+                speed_mps=float(s.speed_mps),
+                target_points=np.asarray(s.target_points, dtype=np.float32),
+                use_cot=use_cot,
+            )
+
+            gt_wps = getattr(s, "gt_wps", None)
+            gt_route = getattr(s, "gt_route", None)
+            ade_wp, fde_wp = (
+                _ade_fde(pred_wps, np.asarray(gt_wps))
+                if (pred_wps is not None and gt_wps is not None)
+                else (float("nan"), float("nan"))
+            )
+            ade_path, fde_path = (
+                _ade_fde(pred_route, np.asarray(gt_route))
+                if (pred_route is not None and gt_route is not None)
+                else (float("nan"), float("nan"))
+            )
+
+            entry = {
+                "meta": getattr(s, "meta", {}),
+                "rgb_path": str(s.rgb_path),
+                "speed_mps": float(s.speed_mps),
+                "target_points": np.asarray(s.target_points).tolist(),
+                "ade_wp": ade_wp,
+                "fde_wp": fde_wp,
+                "ade_path": ade_path,
+                "fde_path": fde_path,
+                "implied_speed_pred": _implied_speed(pred_wps) if pred_wps is not None else None,
+                "implied_speed_gt": _implied_speed(np.asarray(gt_wps)) if gt_wps is not None else None,
+                "pred_commentary": pred_text,
+                "gt_commentary": getattr(s, "gt_commentary", None),
+            }
+            per_sample.append(entry)
+
+            if save_overlays:
+                overlay_path = overlays_dir / f"{i:04d}.png"
+                viz.write_overlay(
+                    rgb_path=s.rgb_path,
+                    pred_wps=pred_wps,
+                    pred_route=pred_route,
+                    gt_wps=gt_wps,
+                    gt_route=gt_route,
+                    pred_text=pred_text,
+                    gt_text=getattr(s, "gt_commentary", None),
+                    out_path=overlay_path,
+                    crop_bottom=getattr(s, "crop_bottom", True),
+                    intrinsics=getattr(s, "intrinsics", None),
+                    fov_deg=getattr(s, "fov_deg", 110.0),
+                    cam_translation_xyz=getattr(
+                        s, "cam_translation_xyz", (0.0, 2.0, 1.5)
+                    ),
+                )
+                n_written += 1
+
+            if (i + 1) % 5 == 0:
+                print(
+                    f"  [{i + 1}] ADE_wp={ade_wp:.2f} FDE_wp={fde_wp:.2f}"
+                    f"  ADE_path={ade_path:.2f} pred='{pred_text[:60]}'",
+                    flush=True,
+                )
+
+        except Exception as exc:
+            print(f"  [{i}] ERROR: {exc!r}", flush=True)
+            per_sample.append({"error": repr(exc), "meta": getattr(s, "meta", {})})
+
+    metrics = _aggregate(per_sample)
+    summary = {
+        "metrics": metrics,
+        "num_samples": sum(1 for _ in per_sample),
+        "num_written": n_written,
+        "out_dir": str(out_dir_p),
+        "ckpt": ckpt_path,
+        "label": label,
+    }
+    with open(out_dir_p / "predictions.json", "w") as fh:
+        json.dump({"summary": summary, "per_sample": per_sample}, fh, indent=2, default=str)
+    print(f">> {label} done — wrote {n_written} overlays", flush=True)
+    return summary
+
+
+def _prepare_frame_context(
+    sample: FrameSample,
+    *,
+    tokenizer,
+    encoder_variant: str,
+    num_image_tokens_total: int,
+    use_cot: bool,
+    use_global_img: bool,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Load measurements + image and assemble the `DrivingInput` for one frame."""
+    measurements_now_to_future = [
+        _load_json_gz(sample.measurements_dir / f"{fi:04d}.json.gz")
+        for fi in range(sample.frame_idx, sample.frame_idx + 12)
+    ]
+    current = measurements_now_to_future[0]
+
+    speed_mps = float(current["speed"])
+    target_point = np.asarray(current["target_point"], dtype=np.float32)
+    next_target_point = np.asarray(current["target_point_next"], dtype=np.float32)
+    target_points = np.stack([target_point, next_target_point], axis=0)
+
+    gt_wps = _compute_waypoints_from_ego_matrix(measurements_now_to_future)
+    gt_path = _equal_spacing_route(np.asarray(current["route"], dtype=np.float32))
+
+    pixel_values, HW = _process_image(sample.rgb_path, use_global_img=use_global_img)
+    prompt_text = _build_prompt(speed_mps, use_cot=use_cot)
+    prompt_ll, prompt_inf_ll = _build_language_label(
+        prompt_text,
+        target_points_np=target_points,
+        tokenizer=tokenizer,
+        encoder_variant=encoder_variant,
+        num_image_tokens_total=num_image_tokens_total,
+        device=device,
+    )
+    driving_input = _build_driving_input(
+        pixel_values,
+        speed_mps=speed_mps,
+        target_points_np=target_points,
+        prompt_ll=prompt_ll,
+        prompt_inference_ll=prompt_inf_ll,
+        HW=HW,
+        device=device,
+    )
+
+    gt_commentary = None
+    if sample.commentary_path is not None:
+        try:
+            gt_commentary = _load_json_gz(sample.commentary_path).get("commentary")
+        except Exception:
+            gt_commentary = None
+
+    return {
+        "driving_input": driving_input,
+        "gt_wps": gt_wps,
+        "gt_path": gt_path,
+        "gt_commentary": gt_commentary,
+        "prompt_text": prompt_text,
+        "speed_mps": speed_mps,
+    }
+
+
+def _stitch_video(image_paths: list[Path], out_path: Path, fps: int) -> None:
+    """Encode a list of PNGs (assumed identical size) into an mp4."""
+    import cv2
+
+    if not image_paths:
+        raise ValueError("no frames to stitch")
+    first = cv2.imread(str(image_paths[0]))
+    if first is None:
+        raise RuntimeError(f"cv2 could not read {image_paths[0]}")
+    h, w, _ = first.shape
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(out_path), fourcc, float(fps), (w, h))
+    try:
+        for p in image_paths:
+            frame = cv2.imread(str(p))
+            if frame is None:
+                print(f"  skip unreadable frame: {p}", flush=True)
+                continue
+            writer.write(frame)
+    finally:
+        writer.release()
+
+
+def run_video_inference(
+    *,
+    ckpt_path: str,
+    hydra_cfg_path: str,
+    data_root: str,
+    out_dir: str,
+    num_frames: int = 200,
+    fps: int = 20,
+    use_cot: bool = True,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Run inference on a contiguous span of validation frames, write per-frame
+    overlays + an mp4, and report wall-clock Hz for the model forward pass."""
+    sys.path.insert(0, "/opt/simlingo")
+    _ensure_internvl_pretrained_symlink()
+
+    from simlingo_training.utils.internvl2_utils import get_num_image_tokens_per_patch
+
+    from . import viz
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f">> device: {device}", flush=True)
+    print(">> loading model", flush=True)
+    t0 = time.time()
+    model, tokenizer, cfg = _load_model(ckpt_path, hydra_cfg_path, device)
+    print(f"   loaded in {time.time() - t0:.1f}s", flush=True)
+
+    use_global_img = bool(cfg.data_module.use_global_img)
+    NUM_IMAGE_PATCHES = 2
+    num_image_tokens_total = (
+        get_num_image_tokens_per_patch(cfg.model.vision_model.variant) * NUM_IMAGE_PATCHES
+    )
+
+    print(">> collecting video samples", flush=True)
+    samples = _collect_video_samples(data_root, num_frames=num_frames, seed=seed)
+    if not samples:
+        raise RuntimeError(
+            f"could not find a route with {num_frames} consecutive usable frames"
+        )
+
+    out_dir_p = Path(out_dir)
+    out_dir_p.mkdir(parents=True, exist_ok=True)
+    overlays_dir = out_dir_p / "overlays"
+    overlays_dir.mkdir(exist_ok=True)
+
+    # Warmup: lazy CUDA kernels (and language-head generation graph) only
+    # materialize on the first call, which makes that call wildly slower than
+    # steady-state. Run once and discard.
+    print(">> warmup", flush=True)
+    warm_ctx = _prepare_frame_context(
+        samples[0],
+        tokenizer=tokenizer,
+        encoder_variant=cfg.model.vision_model.variant,
+        num_image_tokens_total=num_image_tokens_total,
+        use_cot=use_cot,
+        use_global_img=use_global_img,
+        device=device,
+    )
+    with torch.inference_mode():
+        _ = model(warm_ctx["driving_input"])
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    overlay_paths: list[Path] = []
+    per_frame: list[dict[str, float]] = []
+    wall_t0 = time.perf_counter()
+
+    for i, s in enumerate(samples):
+        try:
+            t_total0 = time.perf_counter()
+
+            t_pre0 = time.perf_counter()
+            ctx = _prepare_frame_context(
+                s,
+                tokenizer=tokenizer,
+                encoder_variant=cfg.model.vision_model.variant,
+                num_image_tokens_total=num_image_tokens_total,
+                use_cot=use_cot,
+                use_global_img=use_global_img,
+                device=device,
+            )
+            t_pre = time.perf_counter() - t_pre0
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t_inf0 = time.perf_counter()
+            with torch.inference_mode():
+                speed_wps, route_wps, language = model(ctx["driving_input"])
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t_inf = time.perf_counter() - t_inf0
+
+            pred_wps = (
+                speed_wps[0].float().cpu().numpy() if speed_wps is not None else None
+            )
+            pred_route = (
+                _equal_spacing_route(route_wps[0].float().cpu().numpy(), num=20)
+                if route_wps is not None
+                else None
+            )
+            pred_text = language[0] if language else ""
+
+            overlay_path = overlays_dir / f"{i:04d}.png"
+            viz.write_overlay(
+                rgb_path=s.rgb_path,
+                pred_wps=pred_wps,
+                pred_route=pred_route,
+                gt_wps=ctx["gt_wps"],
+                gt_route=ctx["gt_path"],
+                pred_text=pred_text,
+                gt_text=ctx["gt_commentary"],
+                out_path=overlay_path,
+            )
+            overlay_paths.append(overlay_path)
+
+            t_total = time.perf_counter() - t_total0
+            per_frame.append(
+                {
+                    "preprocess_s": t_pre,
+                    "inference_s": t_inf,
+                    "total_s": t_total,
+                }
+            )
+
+            if (i + 1) % 10 == 0 or i == len(samples) - 1:
+                running_hz = (i + 1) / (time.perf_counter() - wall_t0)
+                print(
+                    f"  [{i + 1:>3}/{len(samples)}] "
+                    f"pre={t_pre * 1000:5.0f}ms inf={t_inf * 1000:5.0f}ms "
+                    f"total={t_total * 1000:5.0f}ms  running_hz={running_hz:.2f}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"  [{i}] ERROR: {exc!r}", flush=True)
+
+    wall_total = time.perf_counter() - wall_t0
+    inf_times = np.asarray([row["inference_s"] for row in per_frame], dtype=np.float64)
+    total_times = np.asarray([row["total_s"] for row in per_frame], dtype=np.float64)
+
+    def _stats(arr: np.ndarray) -> dict[str, float]:
+        return {
+            "mean_ms": float(arr.mean() * 1000),
+            "p50_ms": float(np.median(arr) * 1000),
+            "p90_ms": float(np.percentile(arr, 90) * 1000),
+            "mean_hz": float(1.0 / arr.mean()) if arr.mean() > 0 else float("nan"),
+            "p50_hz": float(1.0 / np.median(arr)) if np.median(arr) > 0 else float("nan"),
+        }
+
+    timing = {
+        "num_frames": len(per_frame),
+        "wall_total_s": wall_total,
+        "wall_hz": (len(per_frame) / wall_total) if wall_total > 0 else float("nan"),
+        "model_forward": _stats(inf_times) if len(inf_times) else {},
+        "end_to_end_per_frame": _stats(total_times) if len(total_times) else {},
+    }
+
+    print(
+        f">> timing: wall_hz={timing['wall_hz']:.2f}  "
+        f"model_forward_mean_hz={timing['model_forward'].get('mean_hz', float('nan')):.2f}  "
+        f"(mean={timing['model_forward'].get('mean_ms', float('nan')):.0f}ms, "
+        f"p50={timing['model_forward'].get('p50_ms', float('nan')):.0f}ms, "
+        f"p90={timing['model_forward'].get('p90_ms', float('nan')):.0f}ms)",
+        flush=True,
+    )
+
+    print(">> stitching video", flush=True)
+    video_path = out_dir_p / "predictions.mp4"
+    _stitch_video(overlay_paths, video_path, fps=fps)
+    print(f"   wrote {video_path}", flush=True)
+
+    summary = {
+        "video_path": str(video_path),
+        "fps": fps,
+        "timing": timing,
+        "out_dir": str(out_dir_p),
+        "ckpt": ckpt_path,
+    }
+    with open(out_dir_p / "video_summary.json", "w") as fh:
+        json.dump(
+            {"summary": summary, "per_frame": per_frame},
+            fh,
+            indent=2,
+            default=str,
+        )
     return summary
 
 

@@ -97,30 +97,71 @@ uv pip install --group simlingo  # or: pip install modal
 modal setup                       # if you haven't auth'd modal yet
 
 cd simlingo
-modal run modal_app.py::prepare_assets    # downloads weights + 1 val chunk
-modal run modal_app.py::run --num-samples 64
+
+# (1) CARLA validation chunk + checkpoint
+modal run modal_app.py::prepare_assets
+modal run modal_app.py::run --num-samples 256 --frame-stride 50
+
+# (2) nuScenes Mini — real-world Boston/Singapore driving (~4 GB)
+modal run modal_app.py::prepare_nuscenes_mini
+modal run modal_app.py::run_on_nuscenes --num-samples 32 --frame-stride 4
 ```
 
-The second command prints aggregate metrics and writes overlay images +
-per-sample JSON into the `simlingo-outputs` Modal volume. Use
-`modal volume get simlingo-outputs <remote-path> <local-path>` to pull the
-images down.
+Each `run*` command prints aggregate metrics and writes overlay images +
+a per-sample JSON into the `simlingo-outputs` Modal volume. Use
+`modal volume get simlingo-outputs <remote-path> <local-path>` to pull
+artifacts down.
 
-`modal run modal_app.py::run --help` (or look at `modal_app.py`) for the rest of
-the knobs (number of routes, GPU type, language eval on/off, etc.).
+`modal run modal_app.py::<fn> --help` for the rest of the knobs.
+
+## Real-world (nuScenes) sanity check
+
+`scripts/nuscenes_loader.py` synthesises a `DrivingInput` from a
+nuScenes-Mini front-camera keyframe by:
+
+- Using the keyframe's CAM_FRONT JPG as-is (no bonnet crop — the nuScenes
+  camera is roof-mounted).
+- Computing **speed** from consecutive ego_pose deltas at the 2 Hz keyframe
+  rate (||Δposition|| / Δt).
+- Computing **target_point** + **next_target_point** by transforming the
+  ego's *actual* future position at t+2 s and t+4 s into the current ego
+  frame. This is what an oracle GPS planner would have output.
+- Reading **camera_intrinsics** directly from
+  `calibrated_sensor.camera_intrinsic`, and the camera translation from
+  `calibrated_sensor.translation` (used only for the overlay projection;
+  the model itself ignores these fields).
+- Building **GT waypoints** at 0.25 s spacing by linearly interpolating
+  the future trajectory; **GT path** is the same trajectory resampled to a
+  1 m-spaced 20-point route.
+
+Expected limitations going CARLA → nuScenes (and later → cart):
+
+1. **FOV mismatch.** CARLA's training camera is 110° hFOV; nuScenes
+   CAM_FRONT is 70°. The model sees a more "zoomed in" view than it expects.
+2. **Sim → real.** No real-world textures, lighting, sensor noise, or
+   pedestrian/vehicle distributions were seen at training time.
+3. **Left- vs right-hand traffic.** CARLA Towns are right-hand traffic.
+   Singapore is left-hand traffic. On those frames the model can pull the
+   trajectory toward the "wrong" side of the road.
+
+Despite all of that, on a 16-frame nuScenes sample the model produces
+contextually accurate commentary (e.g. correctly identifying right turns,
+stopped vehicles at junctions, and walkers) and waypoints within ~1–2 m of
+GT on unambiguous scenes.
 
 ## Layout
 
 ```
 simlingo/
-├── README.md            # this file
-├── pyproject.toml       # local Modal client + ruff
-├── modal_app.py         # Modal image, volumes, entrypoints
+├── README.md             # this file
+├── pyproject.toml        # local Modal client + ruff
+├── modal_app.py          # Modal image, volumes, entrypoints
 ├── scripts/
 │   ├── __init__.py
-│   ├── inference.py     # builds DrivingInput, runs model, computes metrics
-│   └── viz.py           # waypoint overlays on the front-cam image
-└── outputs/             # pulled-down artifacts (gitignored)
+│   ├── inference.py      # builds DrivingInput, runs model, computes metrics
+│   ├── nuscenes_loader.py # nuScenes -> ExternalSample adapter
+│   └── viz.py            # waypoint overlays on the front-cam image
+└── outputs/              # pulled-down artifacts (gitignored)
 ```
 
 ## Things to double-check
